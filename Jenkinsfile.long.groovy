@@ -86,10 +86,10 @@ pipeline {
                         '''
 
                         // Limpieza de contenedores, redes e imagenes temporales.
-                        sh 'docker rm -f apiserver api-tests calc-web e2e-tests unit-tests || true'
-                        sh 'docker network prune -f || true'
-                        sh 'docker image prune -af --filter "until=24h" || true'
-                        sh 'docker builder prune -af --filter "until=24h" || true'
+                        sh 'docker rm -f apiserver api-tests calc-web e2e-tests unit-tests 2>/dev/null || true'
+                        sh 'docker network prune -f 2>/dev/null || true'
+                        sh 'docker image prune -af --filter "until=24h" 2>/dev/null || true'
+                        sh 'docker builder prune -af --filter "until=24h" 2>/dev/null || true'
                         // Limpia el workspace para no acumular archivos entre builds.
                         cleanWs(deleteDirs: true, disableDeferredWipeout: true)
                     }
