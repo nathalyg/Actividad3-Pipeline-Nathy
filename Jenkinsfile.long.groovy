@@ -1,152 +1,118 @@
 pipeline {
-    agent {
-        label 'docker'
-    }
+    agent any
 
     options {
-        timeout(time: 1, unit: 'HOURS')
-    }
-
-    triggers {
-        cron('H */1 * * 1-5')
-        pollSCM('H/10 * * * 1-5')
-    }
-
-    environment {
-        AN_ACCESS_KEY = credentials('my-predefined-secret-text')
-        PULL_REQUEST = "pr-${env.CHANGE_ID}"
-        IMAGE_TAG = "${env.PULL_REQUEST}"
+        // Mantiene la ejecucion acotada y evita builds concurrentes.
+        timeout(time: 60, unit: 'MINUTES')
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(
+            numToKeepStr: '1',
+            artifactNumToKeepStr: '1'
+        ))
     }
 
     stages {
-        stage('Summary') {
+        stage('Source') {
             steps {
-                sh script: """
-                    echo "GIT_BRANCH: ${GIT_BRANCH}"
-                    echo "PULL_REQUEST: ${PULL_REQUEST}"
-                """, label: "Details summary"
-            }
-        }
-
-        stage('Static Analysis') {
-            parallel {
-                stage('Linting') {
-                    agent {
-                        dockerfile {
-                            filename 'Dockerfile.custom'
-                            dir 'ci'
-                            label 'docker'
-                        }
-                    }
-                    steps {
-                        script {
-                            sh "<run lint>"
-                        }
-                    }
-                }
-                stage('DevSecOps Static'){
-                    steps {
-                        echo "<run devsecops tests>"
-                    }
-                }
+                // Clona el repositorio principal del proyecto.
+                git branch: 'master', url: 'https://github.com/nathalyg/Actividad3-Pipeline-Nathy'
             }
         }
 
         stage('Build') {
-            agent {
-                docker {
-                    image 'node:15.1.0-alpine3.10'
-                    label 'docker'
-                }
-            }
             steps {
-                sh "npm install"
-                sh "npm run build"
-                stash name: "DIST", includes: "dist/**"
-                stash name: "NODE_MODULES", includes: "node_modules/**"
-                archiveArtifacts artifacts: 'dist/**'
+                // Construye las imagenes/base necesarias para las pruebas.
+                echo 'Building stage!'
+                sh 'make build'
             }
         }
 
-
-        stage('Test') {
-            parallel {
-                stage('Unit Tests') {
-                    steps {
-                        unstash name: "NODE_MODULES"
-                        sh "npm run test:unit"
-                        junit 'tests/unit/reports/*.xml'
-                    }
-                }
-
-                stage('Browser Tests') {
-                    steps {
-                        unstash name: "DIST"
-                        unstash name: "NODE_MODULES"
-                        sh "npm run test:cypress"
-                        junit 'tests/cypress/reports/*.xml'
-                    }
-                }
-            }
-        }
-
-        stage('Deploy') {
-            agent {
-                label "kubernetes"
-            }
-            when { 
-                beforeAgent true
-                allOf {
-                    equals expected: 'master', actual: BRANCH_NAME
-                    equals expected: 'SUCCESS', actual: currentBuild.currentResult
-                }
-            }
+        stage('Unit tests') {
             steps {
-                unstash name: "DIST"
-                sh "docker build -t app:${env.GIT_COMMIT} ."
-                sh "docker push app:${env.GIT_COMMIT}"
-                script {
-                    withCredentials([file(credentialsId: "K8S_CREDENTIALS", variable: 'KUBECTL_CONFIG_FILE')]) {
-                        sh "kubectl apply --kubeconfig ${KUBECTL_CONFIG_FILE} -f deploy/template.yaml"
-                    }
-                }
+                // Ejecuta las pruebas unitarias y guarda los XML generados.
+                sh 'make test-unit'
+                archiveArtifacts artifacts: 'results/*.xml', allowEmptyArchive: true, fingerprint: true
             }
         }
 
-        stage('DevSecOps Deploy'){
+        stage('API tests') {
             steps {
-                echo "<run devsecops tests>"
+                // Ejecuta las pruebas de API y archiva sus resultados.
+                sh 'make test-api'
+                archiveArtifacts artifacts: 'results/*.xml', allowEmptyArchive: true, fingerprint: true
             }
         }
 
-        stage('Integration tests') {
-            when { 
-                beforeAgent true
-                allOf {
-                    equals expected: 'master', actual: BRANCH_NAME
-                    equals expected: 'SUCCESS', actual: currentBuild.currentResult
-                }
-            }
+        stage('E2E tests') {
             steps {
-                sh "<run int tests>"
-                junit 'tests/integration/reports/*.xml'
+                // Reintenta las pruebas end-to-end si fallan por un problema temporal.
+                retry(2) {
+                    sh 'make test-e2e'
+                }
+                archiveArtifacts artifacts: 'results/*.xml', allowEmptyArchive: true, fingerprint: true
             }
         }
 
+        // stage('Failure simulation') {
+        //     steps {
+        //         // Etapa temporal para evidenciar el bloque post { failure }.
+        //         echo 'Simulando fallo para validar el correo simulado de failure'
+        //         sh 'exit 1'
+        //     }
+        // }
     }
 
     post {
+        always {
+            script {
+                // Simulacion de correo y evidencia de ejecucion para cualquier estado.
+                echo "EMAIL SIMULADO (ALWAYS): Job ${env.JOB_NAME}, build #${env.BUILD_NUMBER}, estado ${currentBuild.currentResult}"
+
+                if (env.WORKSPACE?.trim()) {
+                    // Publica los resultados JUnit antes de limpiar el workspace.
+                    junit allowEmptyResults: true, testResults: 'results/*_result.xml'
+
+                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                        // Conserva una copia persistente de los XML por numero de build.
+                        sh '''
+                            DEST="/var/jenkins_home/reports/${JOB_NAME}/${BUILD_NUMBER}"
+                            mkdir -p "$DEST"
+                            if [ -d results ]; then
+                              cp -a results/. "$DEST"/
+                            fi
+                            echo "Reportes persistidos en: $DEST"
+                            ls -lah "$DEST" || true
+                        '''
+
+                        // Limpieza de contenedores, redes e imagenes temporales.
+                        sh 'docker rm -f apiserver api-tests calc-web e2e-tests unit-tests || true'
+                        sh 'docker network prune -f || true'
+                        sh 'docker image prune -af --filter "until=24h" || true'
+                        sh 'docker builder prune -af --filter "until=24h" || true'
+                        // Limpia el workspace para no acumular archivos entre builds.
+                        cleanWs(deleteDirs: true, disableDeferredWipeout: true)
+                    }
+                } else {
+                    // Cuando el build se aborta antes de obtener executor, no existe workspace utilizable.
+                    echo 'Build abortado antes de asignar executor; se omite junit/cleanWs.'
+                }
+            }
+        }
+
         success {
-            emailext subject: "Pipeline successful", to: "devs@unir.net"
-            cleanWs()
+            // Mensaje de correo simulado en caso de exito.
+            echo "EMAIL SIMULADO (SUCCESS): Job ${env.JOB_NAME}, build #${env.BUILD_NUMBER}, estado EXITOSO"
         }
-        unstable {
-            emailext subject: "Pipeline tests not successful", to: "devs@unir.net"
-            cleanWs()
-        }
+
         failure {
-            emailext subject: "Pipeline error", to: "devops@unir.net,devs@unir.net"
-            cleanWs()
+            // Mensaje de correo simulado en caso de fallo.
+            echo "EMAIL SIMULADO (FAILURE): Job ${env.JOB_NAME}, build #${env.BUILD_NUMBER}, estado FALLIDO"
+            // emailext(
+            //   to: 'correo@dominio.com',
+            //   subject: "Fallo en ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+            //   body: "El trabajo ${env.JOB_NAME} terminó con fallo en la ejecución #${env.BUILD_NUMBER}."
+            // )
         }
     }
 }
